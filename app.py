@@ -40,7 +40,7 @@ class DiscordBot:
         self.resume_gateway_url = None
         self.heartbeat_interval = None
         self.headers = {
-            "Authorization": f"Bot {token}",
+            "Authorization": f"{token}",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
         self.api_url = "https://discord.com/api/v10"
@@ -144,6 +144,7 @@ class DiscordBot:
         message_count = 0
         page = 1
         last_message_id = None
+        found_files_total = 0
         
         try:
             while True:
@@ -153,7 +154,7 @@ class DiscordBot:
                     url = f"{self.api_url}/channels/{channel_id}/messages?limit=100"
                 
                 print(f"    [*] Sayfa {page} taranıyor...")
-                response = requests.get(url, headers=self.headers)
+                response = requests.get(url, headers=self.headers, timeout=30)
                 
                 if response.status_code != 200:
                     if response.status_code == 429:
@@ -161,11 +162,13 @@ class DiscordBot:
                         print(f"    [!] Rate limit - {retry_after} saniye bekleniyor...")
                         time.sleep(retry_after)
                         continue
+                    print(f"    [-] API Hatası: {response.status_code}")
                     break
                 
                 messages = response.json()
                 
                 if not messages:
+                    print(f"    [*] Daha fazla mesaj yok")
                     break
                 
                 message_count += len(messages)
@@ -189,19 +192,26 @@ class DiscordBot:
                                 }
                                 page_files.append(file_info)
                                 self.processed_files.add(file_id)
+                                found_files_total += 1
                                 print(f"        [+] Bulundu: {filename} ({attachment.get('size', 0) // 1024} KB)")
                 
                 if page_files:
                     print(f"\n    [*] Bu sayfadaki {len(page_files)} dosya yükleniyor...")
                     yield page_files
                     print(f"")
+                else:
+                    print(f"    [*] Bu sayfada dosya yok")
                 
                 if messages:
                     last_message_id = messages[-1].get("id")
                 else:
                     break
+                
+                page += 1
+                # Rate limit önlemek için
+                time.sleep(0.5)
             
-            print(f"    [+] {message_count} mesaj tarandı")
+            print(f"    [+] {message_count} mesaj tarandı, {found_files_total} dosya bulundu")
                         
         except Exception as e:
             print(f"    [-] Hata: {e}")
@@ -210,25 +220,42 @@ class DiscordBot:
         """Discord'a dosya yükle"""
         try:
             print(f"    [*] İndiriliyor: {filename}")
-            file_response = requests.get(file_url)
+            file_response = requests.get(file_url, timeout=30)
             
             if file_response.status_code != 200:
-                print(f"    [-] İndirme hatası")
+                print(f"    [-] İndirme hatası: {file_response.status_code}")
                 return False
             
+            print(f"    [*] Discord'a yükleniyor...")
             files = {'file': (filename, file_response.content)}
             data = {'content': f'📦 **{filename}**'}
             
             url = f"{self.api_url}/channels/{channel_id}/messages"
-            response = requests.post(url, headers=self.headers, files=files, data=data)
+            response = requests.post(url, headers=self.headers, files=files, data=data, timeout=30)
             
             if response.status_code == 200:
                 print(f"    [+] Yüklendi: {filename}")
                 return True
+            elif response.status_code == 429:
+                retry_after = response.json().get("retry_after", 5)
+                print(f"    [!] Rate limit - {retry_after} saniye bekleniyor...")
+                time.sleep(retry_after)
+                # Tekrar dene
+                response = requests.post(url, headers=self.headers, files=files, data=data, timeout=30)
+                if response.status_code == 200:
+                    print(f"    [+] Yüklendi: {filename}")
+                    return True
+                else:
+                    print(f"    [-] Yükleme hatası: {response.status_code} - {response.text}")
+                    return False
             else:
                 print(f"    [-] Yükleme hatası: {response.status_code}")
+                print(f"    [-] Hata: {response.text}")
                 return False
                 
+        except requests.exceptions.Timeout:
+            print(f"    [-] Timeout hatası")
+            return False
         except Exception as e:
             print(f"    [-] Hata: {e}")
             return False

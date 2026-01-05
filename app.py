@@ -1,13 +1,14 @@
 import asyncio
 import websockets
 import json
-import sys
 import os
 import requests
 import time
 from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
 
 # .env dosyasını yükle
 load_dotenv()
@@ -18,12 +19,16 @@ SOURCE_CHANNEL_ID = os.getenv("SOURCE_CHANNEL_ID", "1011057472888389702")
 TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "1457815031839199267")
 # ==================================================
 
-# Hariç tutulacak dosya türleri (video ve resim)
+# Hariç tutulacak dosya türleri
 EXCLUDED_EXTENSIONS = {
     '.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.m4v',
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.webp', '.ico',
     '.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma'
 }
+
+# Global bot instance
+bot_instance = None
+bot_running = False
 
 class DiscordBot:
     def __init__(self, token: str):
@@ -39,21 +44,19 @@ class DiscordBot:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
         self.api_url = "https://discord.com/api/v10"
-        self.processed_files = set()  # Duplicate önlemek için
+        self.processed_files = set()
         
     async def connect(self):
         """Connect to Discord Gateway"""
         print("[*] Discord Gateway'e bağlanıyor...")
         
         try:
-            # Discord Gateway URL
             gateway_url = "wss://gateway.discord.gg/?v=10&encoding=json"
             
             async with websockets.connect(gateway_url) as websocket:
                 self.ws = websocket
                 print("[+] WebSocket bağlantısı kuruldu")
                 
-                # Listen for messages
                 async for message in websocket:
                     await self.handle_message(message)
                     
@@ -65,18 +68,14 @@ class DiscordBot:
         data = json.loads(message)
         op = data.get("op")
         
-        if op == 10:  # HELLO
+        if op == 10:
             print("[+] HELLO mesajı alındı")
             self.heartbeat_interval = data["d"]["heartbeat_interval"]
-            print(f"[*] Heartbeat intervali: {self.heartbeat_interval}ms")
             
-            # Identify bot
             await self.identify()
-            
-            # Start heartbeat
             asyncio.create_task(self.heartbeat(self.heartbeat_interval / 1000))
             
-        elif op == 0:  # DISPATCH
+        elif op == 0:
             event_type = data.get("t")
             self.sequence = data.get("s")
             
@@ -88,24 +87,13 @@ class DiscordBot:
                 
                 print(f"\n[+] === BOT BAŞARILI İLE BAĞLANDI ===")
                 print(f"[+] Bot Adı: {self.bot_name}")
-                print(f"[+] User ID: {user_data.get('id')}")
-                print(f"[+] Bot mı?: {user_data.get('bot')}")
                 print(f"[+] ========================\n")
                 
-            elif event_type == "MESSAGE_CREATE":
-                message_data = data["d"]
-                author = message_data.get("author", {}).get("username")
-                content = message_data.get("content")
-                # Dosya bilgisini göster
-                attachments = message_data.get("attachments", [])
-                if attachments:
-                    print(f"[MESSAGE] {author}: {len(attachments)} dosya - {content}")
-                
-        elif op == 1:  # HEARTBEAT request
+        elif op == 1:
             await self.send_heartbeat()
             
-        elif op == 11:  # HEARTBEAT_ACK
-            pass  # Silent
+        elif op == 11:
+            pass
             
     async def identify(self):
         """Send IDENTIFY message to Discord"""
@@ -113,7 +101,7 @@ class DiscordBot:
             "op": 2,
             "d": {
                 "token": self.token,
-                "intents": 513,  # GUILDS | GUILD_MESSAGES
+                "intents": 513,
                 "properties": {
                     "os": "Windows",
                     "browser": "CrustyBot",
@@ -151,36 +139,14 @@ class DiscordBot:
         file_ext = os.path.splitext(filename)[1].lower()
         return file_ext not in EXCLUDED_EXTENSIONS and file_ext != ""
     
-    def get_all_channels_from_guild(self, guild_id: str):
-        """Sunucudaki tüm kanalları al"""
-        print(f"\n[*] Sunucu {guild_id}'daki kanallar taranıyor...")
-        
-        try:
-            url = f"{self.api_url}/guilds/{guild_id}/channels"
-            response = requests.get(url, headers=self.headers)
-            
-            if response.status_code == 200:
-                channels = response.json()
-                text_channels = [ch for ch in channels if ch.get("type") == 0]  # type 0 = text channel
-                print(f"[+] {len(text_channels)} metin kanalı bulundu")
-                return text_channels
-            else:
-                print(f"[-] Hata {response.status_code}: {response.text}")
-                return []
-                
-        except Exception as e:
-            print(f"[-] Hata: {e}")
-            return []
-    
     def get_all_messages_from_channel(self, channel_id: str, channel_name: str):
-        """Kanaldan TÜM mesajları geriye doğru taraması (en eskileri bulana kadar)"""
+        """Kanaldan TÜM mesajları geriye doğru taraması"""
         message_count = 0
         page = 1
         last_message_id = None
         
         try:
             while True:
-                # Geriye doğru tarama (before parametresi ile)
                 if last_message_id:
                     url = f"{self.api_url}/channels/{channel_id}/messages?limit=100&before={last_message_id}"
                 else:
@@ -190,7 +156,7 @@ class DiscordBot:
                 response = requests.get(url, headers=self.headers)
                 
                 if response.status_code != 200:
-                    if response.status_code == 429:  # Rate limit
+                    if response.status_code == 429:
                         retry_after = response.json().get("retry_after", 1)
                         print(f"    [!] Rate limit - {retry_after} saniye bekleniyor...")
                         time.sleep(retry_after)
@@ -205,14 +171,12 @@ class DiscordBot:
                 message_count += len(messages)
                 page_files = []
                 
-                # Bu sayfadaki dosyaları bul
                 for message in messages:
                     attachments = message.get("attachments", [])
                     
                     for attachment in attachments:
                         filename = attachment.get("filename", "")
                         
-                        # Sadece izin verilen dosyalar
                         if self.is_valid_file(filename):
                             file_id = f"{channel_id}_{filename}"
                             if file_id not in self.processed_files:
@@ -227,13 +191,11 @@ class DiscordBot:
                                 self.processed_files.add(file_id)
                                 print(f"        [+] Bulundu: {filename} ({attachment.get('size', 0) // 1024} KB)")
                 
-                # Bu sayfada bulunan dosyaları hemen gönder
                 if page_files:
                     print(f"\n    [*] Bu sayfadaki {len(page_files)} dosya yükleniyor...")
                     yield page_files
                     print(f"")
                 
-                # Son mesajın ID'sini al (sonraki sayfada before için)
                 if messages:
                     last_message_id = messages[-1].get("id")
                 else:
@@ -244,36 +206,9 @@ class DiscordBot:
         except Exception as e:
             print(f"    [-] Hata: {e}")
     
-    def find_all_files(self, guild_id: str):
-        """Sunucudaki tüm dosyaları bul (tüm kanalları tara)"""
-        print(f"\n[*] {guild_id} sunucusunda TÜÜN dosyalar aranıyor...\n")
-        
-        channels = self.get_all_channels_from_guild(guild_id)
-        all_files = []
-        
-        for idx, channel in enumerate(channels, 1):
-            channel_id = channel.get("id")
-            channel_name = channel.get("name")
-            
-            print(f"\n[{idx}/{len(channels)}] Kanal taranıyor: #{channel_name} ({channel_id})")
-            
-            files = self.get_all_messages_from_channel(channel_id, channel_name)
-            all_files.extend(files)
-            
-            # Rate limit önlemek için
-            time.sleep(0.5)
-        
-        if all_files:
-            print(f"\n[+] === TOPLAM {len(all_files)} DOSYA BULUNDU ===\n")
-        else:
-            print(f"\n[-] Dosya bulunamadı\n")
-        
-        return all_files
-    
     def upload_file_to_channel(self, channel_id: str, file_url: str, filename: str):
         """Discord'a dosya yükle"""
         try:
-            # Dosyayı indir
             print(f"    [*] İndiriliyor: {filename}")
             file_response = requests.get(file_url)
             
@@ -281,7 +216,6 @@ class DiscordBot:
                 print(f"    [-] İndirme hatası")
                 return False
             
-            # Discord'a yükle
             files = {'file': (filename, file_response.content)}
             data = {'content': f'📦 **{filename}**'}
             
@@ -299,20 +233,20 @@ class DiscordBot:
             print(f"    [-] Hata: {e}")
             return False
     
-    def sync_build_files(self, source_guild_id: str, target_channel_id: str, interval: int = 10):
-        """Belirli bir kanaldan hedef kanala dosya senkronize et (sayfa sayfa)"""
+    def sync_build_files(self, target_channel_id: str, interval: int = 10):
+        """Belirli bir kanaldan hedef kanala dosya senkronize et"""
+        
+        global bot_running
+        bot_running = True
         
         print(f"\n{'='*70}")
         print(f"[*] SİNCRONİZASYON BAŞLANIYOR")
-        print(f"[*] Kanal: 1011057472888389702 → {target_channel_id}")
+        print(f"[*] Kanal: {SOURCE_CHANNEL_ID} → {target_channel_id}")
         print(f"{'='*70}\n")
         
-        # Sadece belirtilen kanalı tara
-        scan_channel_id = "1011057472888389702"  # Taranacak kanal
-        
+        scan_channel_id = SOURCE_CHANNEL_ID
         print(f"[*] Kanal taranıyor: {scan_channel_id}\n")
         
-        # Generator kullanarak sayfa sayfa işle
         page_generator = self.get_all_messages_from_channel(scan_channel_id, "scan_channel")
         
         total_uploaded = 0
@@ -344,7 +278,6 @@ class DiscordBot:
                         failed_count += 1
                         total_failed += 1
                     
-                    # Her dosya arasında interval
                     if idx < len(page_files):
                         print(f"    [*] {interval} saniye bekleniyor...\n")
                         time.sleep(interval)
@@ -364,41 +297,56 @@ class DiscordBot:
         print(f"[+] Toplam Başarısız: {total_failed}")
         print(f"[+] İşlenen Sayfa: {page_count}")
         print(f"{'='*70}\n")
+        
+        bot_running = False
 
-async def main():
-    print("\n" + "=" * 70)
-    print("   DISCORD BOT - DOSYA SENKRONIZASYON SİSTEMİ")
-    print("=" * 70 + "\n")
-    
-    # .env dosyasından oku
-    token = BOT_TOKEN
-    source_channel_id = SOURCE_CHANNEL_ID
-    target_channel_id = TARGET_CHANNEL_ID
-    interval = 10  # 10 saniye aralık
-    
-    # Token kontrolü
-    if not token:
+# ============== FLASK WEB SUNUCUSU ==============
+app = Flask(__name__)
+
+@app.route('/')
+def status():
+    return "Bot Aktif"
+
+# ==================================================
+
+# Discord Bot'u arka planda çalıştır
+def run_bot():
+    """Discord bot'u async loop'ta çalıştır"""
+    if not BOT_TOKEN:
         print("[-] HATA: Token ayarlanmamış!")
-        print("[*] Kök klasöre .env dosyası oluşturun şu içerikle:\n")
-        print("BOT_TOKEN=YOUR_TOKEN_HERE")
-        print("SOURCE_CHANNEL_ID=1011057472888389702")
-        print("TARGET_CHANNEL_ID=1457815031839199267")
+        print("[*] .env dosyasında BOT_TOKEN ayarlayın")
         return
     
-    print(f"[+] .env dosyası yüklendi!")
-    print(f"[+] Token: {token[:30]}...")
-    print(f"[+] Kaynak Kanal: {source_channel_id}")
-    print(f"[+] Hedef Kanal: {target_channel_id}")
-    print(f"[+] Aralık: {interval} saniye\n")
+    print(f"[+] Bot başlatılıyor...")
+    global bot_instance
+    bot_instance = DiscordBot(BOT_TOKEN)
     
-    bot = DiscordBot(token)
+    # Event loop oluştur ve bot'u çalıştır
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
-    # Direk senkronize et
-    print("[*] Senkronizasyon başlatılıyor...\n")
-    bot.sync_build_files("", target_channel_id, interval)
+    try:
+        loop.run_until_complete(bot_instance.connect())
+    except KeyboardInterrupt:
+        print("\n[-] Bot kapatıldı")
+    finally:
+        loop.close()
+
+def start_sync():
+    """Senkronizasyonu başlat"""
+    if bot_instance:
+        bot_instance.sync_build_files(TARGET_CHANNEL_ID, 10)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n\n[-] Bot kapatıldı")
+    # Bot'u ayrı thread'te başlat
+    bot_thread = Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    
+    # Kısa gecikmeden sonra senkronizasyonu başlat
+    time.sleep(2)
+    sync_thread = Thread(target=start_sync, daemon=True)
+    sync_thread.start()
+    
+    # Flask web sunucusunu başlat
+    print("\n[+] Flask web sunucusu başlatılıyor: http://localhost:5000")
+    app.run(host='0.0.0.0', port=5000, debug=False)
